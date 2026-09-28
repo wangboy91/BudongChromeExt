@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>抖音参考视频下载</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="header">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">↘</span><div><h1>视频下载</h1><p>保存当前抖音页的视频素材</p></div></div>
+        <button id="refresh" class="icon-button" type="button" title="重新检测" aria-label="重新检测视频">↻</button>
+      </header>
+      <section class="results" aria-labelledby="results-heading">
+        <div class="section-heading"><h2 id="results-heading">检测到的视频</h2><span id="count" class="count">—</span></div>
+        <div id="list" class="list" aria-live="polite"></div>
+      </section>
+      <footer class="footer"><span class="status-dot" aria-hidden="true"></span><span id="status" role="status" aria-live="polite">正在检测当前页面…</span></footer>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

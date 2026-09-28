@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "抖音参考视频下载",
+  "version": "0.4.2",
+  "description": "检测并保存当前抖音页面提供的视频，供本地参考分析使用。",
+  "permissions": ["activeTab", "scripting", "downloads"],
+  "action": {
+    "default_title": "查看当前抖音视频",
+    "default_popup": "popup.html"
+  }
+}
