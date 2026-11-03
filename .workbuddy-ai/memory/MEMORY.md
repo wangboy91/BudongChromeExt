@@ -13,7 +13,7 @@
 | 目录 | 说明 |
 | --- | --- |
 | `douyin-reference-downloader/` | 抖音参考视频下载。读 `RENDER_DATA` + React fiber 拿多清晰度 MP4。 |
-| `media-downloader/` | 音视频下载（通用）。webRequest + DOM 扫描 + blob 钩子，支持 HLS 合并、预览播放器；`platforms.js` 做单平台文案/命名增强。 |
+| `media-downloader/` | 音视频下载（通用）。webRequest + DOM 扫描 + blob 钩子，支持 HLS 合并、预览播放器；`platforms.js` 做平台增强（抖音/B站/网易云/QQ音乐/央视网/YouTube）。 |
 
 ## 通用嗅探 + 平台增强的分层约定（media-downloader）
 
@@ -21,6 +21,21 @@
 - **平台层**只做增强，永远可选、永远可失败：命中适配器就多给「作者/标题/文案」和更好的文件名；没命中或读不到数据就静默退回通用行为。
 - 新增平台只需在 `platforms.js` 加一条 `register({...})`，不改其他文件。
 - `extract()` 走 `world:"MAIN"` 注入，**必须自包含**；`filename()` 只返回不含扩展名的基名。
+- 适配器可选钩子：`canResolve`/`resolve`（把嗅探到的地址换成可下载地址）、`hideItem`（滤掉无价值条目）、`cacheKey`/`cacheMs`。
+- `extract()` 返回的 `streams` 会被追加进列表。条目可带 **`pageDownload: true`**，表示这条地址
+  必须由页面世界带 `Range` 取回（`popup.js` 的 `pageFetchAndSave` → Blob → 页面 `<a download>`）。
+  适用于 googlevideo 这类「既查 Range 头又查来源」的地址。
+- 内容脚本注入顺序有依赖：`content.js` 第一行就读 `globalThis.MediaTypes`，所以 manifest 的
+  `content_scripts` 里 **`media-types.js` 必须排在 `content.js` 前面**（漏了会导致内容脚本整体不执行）。
+
+## 验证踩坑（写测试脚本时）
+
+- 用 CDP 的 `Browser.setDownloadBehavior` 会让 Chrome **忽略** `chrome.downloads.download` 的
+  `filename` 参数（文件名退化成 URL 名或 blob UUID）。要验证文件名，就预先往 profile 的
+  `Default/Preferences` 写 `download.default_directory`，别用 CDP 的下载行为。
+- 无头 Chrome 里加载扩展：`Extensions.loadUnpacked` + 打开
+  `chrome-extension://<id>/popup.html` 当宿主页，用 `chrome.scripting.executeScript` 驱动。
+
 
 ## 技术约定
 

@@ -124,7 +124,20 @@
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const data = event.data;
-    if (!data || data.__mediaSniffer !== true || data.type !== "BLOB_MEDIA") return;
+    if (!data) return;
+
+    // 弹窗注入页面世界下载大文件时，把进度转发给弹窗（弹窗可能已经关了，忽略失败即可）。
+    if (data.__mediaDownloaderProgress) {
+      try {
+        const result = chrome.runtime.sendMessage({ type: "download-progress", ...data.__mediaDownloaderProgress });
+        if (result && typeof result.catch === "function") result.catch(() => {});
+      } catch (error) {
+        // 忽略。
+      }
+      return;
+    }
+
+    if (data.__mediaSniffer !== true || data.type !== "BLOB_MEDIA") return;
     try {
       const result = chrome.runtime.sendMessage({
         cmd: "blob",

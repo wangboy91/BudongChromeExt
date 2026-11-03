@@ -68,6 +68,10 @@
           <div class="progress-track"><i id="progress-fill"></i></div>
           <span id="progress-text" class="progress-text"></span>
         </div>
+        <div id="hint" class="hint" hidden>
+          <code id="hint-text"></code>
+          <button id="hint-copy" class="mini" type="button" title="复制命令" aria-label="复制命令">复制</button>
+        </div>
         <div class="footer-row options">
           <label class="option"><input type="checkbox" id="ask-save" /> 保存前询问位置</label>
           <label class="option"><input type="checkbox" id="show-segments" /> 显示流分片</label>
@@ -76,6 +80,7 @@
     </main>
 
     <script src="media-types.js"></script>
+    <script src="douyin.js"></script>
     <script src="platforms.js"></script>
     <script src="popup.js"></script>
   </body>

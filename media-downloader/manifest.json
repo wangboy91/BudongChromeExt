@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "音视频下载",
-  "version": "0.2.0",
-  "description": "通用音视频嗅探下载：支持 mp3/m4a/flac/wav/ogg/opus 等音频、mp4/webm 等视频，以及 HLS 流；对抖音、B 站、网易云、QQ 音乐额外做文案提取与文件命名优化。",
+  "version": "0.3.2",
+  "description": "通用音视频嗅探下载：支持 mp3/m4a/flac/wav/ogg/opus 等音频、mp4/webm 等视频，以及 HLS 流；对抖音、B 站、网易云、QQ 音乐额外做文案提取与文件命名优化；对央视网自动绕开加密流、对 YouTube 直接取回可下载直链。",
   "minimum_chrome_version": "111",
   "permissions": ["webRequest", "downloads", "scripting", "tabs", "storage"],
   "host_permissions": ["<all_urls>"],
@@ -29,7 +29,7 @@
     },
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["media-types.js", "content.js"],
       "run_at": "document_start",
       "all_frames": true
     }

@@ -307,4 +307,29 @@ h2 { font-size: 13px; font-weight: 650; color: #e6e8eb; }
 .progress-track > i { display: block; height: 100%; width: 0; background: #4eabed; transition: width .15s linear; }
 .progress-text { flex: 0 0 auto; color: #9dd5fb; font-variant-numeric: tabular-nums; }
 
+/* 需要用户带走的信息（目前是 ffmpeg 合并命令），状态栏一行放不下。 */
+.hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 8px 6px 10px;
+  border: 1px solid #4d4531;
+  border-radius: 8px;
+  background: #262117;
+  color: #ffcf8b;
+  font-size: 11px;
+}
+.hint code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  color: #ffe0b0;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Courier New", monospace;
+  white-space: pre;
+}
+.hint code::-webkit-scrollbar { height: 6px; }
+.hint code::-webkit-scrollbar-thumb { background: #55503c; border-radius: 3px; }
+
 button:focus-visible, .chip:focus-visible { outline: 2px solid #a8ddff; outline-offset: 2px; }

@@ -1,6 +1,7 @@
 /**
- * 弹窗逻辑：列表渲染 + 三种下载路径。
+ * 弹窗逻辑：列表渲染 + 四种下载路径。
  *  - 直链（http/https）：交给 Chrome 下载管理器
+ *  - 页面受限直链（YouTube 自适应流）：注入页面世界带 Range 取回 -> Blob -> 页面下载
  *  - blob:（页面内存流）：请页面世界读成 data URL 再下载
  *  - HLS(.m3u8)：解析播放列表 -> 拉取分片 -> 解密(AES-128) -> 拼接成单个文件
  */
@@ -23,6 +24,9 @@
     progress: document.getElementById("progress"),
     progressFill: document.getElementById("progress-fill"),
     progressText: document.getElementById("progress-text"),
+    hint: document.getElementById("hint"),
+    hintText: document.getElementById("hint-text"),
+    hintCopy: document.getElementById("hint-copy"),
     meta: document.getElementById("meta"),
     metaPlatform: document.getElementById("meta-platform"),
     metaAuthor: document.getElementById("meta-author"),
@@ -85,6 +89,14 @@
     els.progress.hidden = false;
     els.progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
     els.progressText.textContent = text || `${Math.round(percent)}%`;
+  }
+
+  /** 状态栏只有一行，放不下的内容（合并命令之类）走这条提示条。 */
+  function setHint(text) {
+    const value = String(text || "").trim();
+    els.hint.hidden = !value;
+    els.hintText.textContent = value;
+    if (!value) els.hintText.scrollLeft = 0;
   }
 
   function shortHash(text) {
@@ -187,8 +199,30 @@
 
   /* ------------------------------------------------------------ 列表渲染 */
 
+  /**
+   * 只有平台真的给出了替代数据，才允许它藏掉嗅探到的噪音条目。
+   * 否则一旦取直链失败，列表会变成空的，用户反而什么都下不了。
+   */
+  function platformHideEnabled() {
+    const adapter = state.platform;
+    if (!adapter || typeof adapter.hideItem !== "function") return false;
+    const streams = state.platformMeta && state.platformMeta.streams;
+    return Array.isArray(streams) && streams.length > 0;
+  }
+
   function allVisible() {
-    return state.items.filter((item) => state.showSegments || !item.hidden);
+    return state.items.filter((item) => {
+      if (state.showSegments) return true;
+      if (item.hidden) return false;
+      if (platformHideEnabled()) {
+        try {
+          if (state.platform.hideItem(item)) return false;
+        } catch (error) {
+          // 适配器出错不影响列表。
+        }
+      }
+      return true;
+    });
   }
 
   function filtered() {
@@ -216,8 +250,12 @@
     if (duration) parts.push({ text: duration });
     if (item.source === "blob") parts.push({ text: "内存流", className: "warn" });
     else if (item.source === "dom") parts.push({ text: "页面元素" });
+    if (item.resolvedNote) parts.push({ text: item.resolvedNote });
     if (item.kind === "hls") parts.push({ text: "HLS 播放列表" });
     if (item.kind === "dash") parts.push({ text: "DASH 播放列表", className: "warn" });
+    if (item.source === "youtube" && item.kind === "video") {
+      parts.push(item.hasAudio ? { text: "含音频" } : { text: "需配音频", className: "warn" });
+    }
     if (item.hidden) parts.push({ text: "分片", className: "warn" });
     return parts;
   }
@@ -264,6 +302,7 @@
     download.addEventListener("click", async () => {
       download.disabled = true;
       download.textContent = "处理中…";
+      setHint("");
       state.pending += 1;
       try {
         await runDownload(item);
@@ -338,6 +377,188 @@
       // 给下载管理器留出读取时间，之后再回收内存。
       setTimeout(() => URL.revokeObjectURL(url), 120000);
     }
+  }
+
+  /**
+   * 在页面世界执行：带 Range 头把整段数据取回来，做成 Blob，再用 <a download> 落到下载目录。
+   *
+   * 为什么非得在页面里做：googlevideo 的自适应流既要求 Range 头，又要求请求来自
+   * youtube.com 这个源；扩展自己的源（chrome-extension://）会被 403。
+   *
+   * 这个函数会被 chrome.scripting.executeScript 序列化后注入，所以**必须自包含**，
+   * 不能引用外面的任何变量。整段跑在页面里，弹窗关掉也不影响下载。
+   * 进度通过 window.postMessage 报给内容脚本，再由内容脚本转给弹窗。
+   */
+  async function pageFetchAndSave(url, filename) {
+    const post = (payload) => {
+      try {
+        window.postMessage({ __mediaDownloaderProgress: payload }, "*");
+      } catch (error) {
+        // 页面不让发就算了，进度条是锦上添花。
+      }
+    };
+    post({ phase: "start", total: 0 });
+
+    // googlevideo 会时不时抽风（403 / 直接断连），隔一小会儿重试通常就过了。
+    let response = null;
+    let lastError = "";
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const candidate = await fetch(url, { headers: { Range: "bytes=0-" }, cache: "no-store" });
+        if (candidate.ok) {
+          response = candidate;
+          break;
+        }
+        lastError = `HTTP ${candidate.status}`;
+      } catch (error) {
+        lastError = (error && error.message) || String(error);
+      }
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 600 + attempt * 1400));
+    }
+    if (!response) {
+      post({ phase: "error", message: lastError });
+      return { error: `取回失败（${lastError}）。` };
+    }
+
+    // 206 时 content-range 里的总数最准，否则退回 content-length。
+    const range = response.headers.get("content-range") || "";
+    const fromRange = Number((range.match(/\/(\d+)\s*$/) || [])[1]) || 0;
+    const expected = fromRange || Number(response.headers.get("content-length")) || 0;
+
+    const chunks = [];
+    let received = 0;
+    let lastReport = 0;
+    if (response.body && response.body.getReader) {
+      const reader = response.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          chunks.push(value);
+          received += value.length;
+          const now = Date.now();
+          if (now - lastReport > 400) {
+            lastReport = now;
+            post({ phase: "progress", received, total: expected });
+          }
+        }
+      }
+    } else {
+      const buffer = await response.arrayBuffer();
+      chunks.push(new Uint8Array(buffer));
+      received = buffer.byteLength;
+    }
+    if (!received) {
+      post({ phase: "error", message: "空数据" });
+      return { error: "取回的数据是空的。" };
+    }
+
+    const blob = new Blob(chunks, { type: response.headers.get("content-type") || "application/octet-stream" });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = filename || "video";
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    // 下载管理器读完之前不能撤销，留足时间（页面通常早就关了，这里只是兜底）。
+    setTimeout(() => {
+      try {
+        URL.revokeObjectURL(objectUrl);
+      } catch (error) {
+        // 忽略。
+      }
+    }, 10 * 60 * 1000);
+
+    post({ phase: "done", received: blob.size, total: blob.size });
+    return { size: blob.size, type: blob.type };
+  }
+
+  /**
+   * 从页面世界取回并下载。适用于 YouTube 的自适应流：
+   * chrome.downloads 没法带 Range 头、也没法伪装来源，只能让页面自己来。
+   */
+  async function downloadViaPage(item, filename) {
+    if (state.tabId == null) throw new Error("找不到页面，请重新打开弹窗。");
+    setStatus(`正在页面里取回 ${filename}…（下载会在浏览器下载栏继续）`, "busy");
+    let injected;
+    try {
+      injected = await chrome.scripting.executeScript({
+        target: { tabId: state.tabId, frameIds: [0] },
+        world: "MAIN",
+        func: pageFetchAndSave,
+        args: [item.url, filename]
+      });
+    } catch (error) {
+      throw new Error(`无法在页面里执行：${(error && error.message) || error}`);
+    }
+    const result = injected && injected[0] && injected[0].result;
+    if (!result) throw new Error("页面里没有返回数据，请刷新页面后重试。");
+    if (result.error) throw new Error(result.error);
+    return Number(result.size) || 0;
+  }
+
+  /** 页面世界取回大文件时的进度（内容脚本转发过来）。 */
+  function applyDownloadProgress(message) {
+    const phase = message.phase;
+    const received = Number(message.received) || 0;
+    const total = Number(message.total) || 0;
+    if (phase === "error" || phase === "done") {
+      setProgress(null);
+      return;
+    }
+    const label = total
+      ? `${MT.formatBytes(received)} / ${MT.formatBytes(total)}`
+      : `已取回 ${MT.formatBytes(received)}`;
+    setProgress(total ? (received / total) * 100 : 50, label);
+  }
+
+  /** 统一下载入口：页面受限的地址让页面自己取，其余交给下载管理器。 */
+  async function saveItem(item, filename) {
+    if (state.platform?.id === "douyin" && /^https:/.test(item.url) && item.kind === "video") {
+      const injected = await chrome.scripting.executeScript({
+        target: { tabId: state.tabId, frameIds: [0] },
+        world: "MAIN",
+        func: DouyinMedia.download,
+        args: [item, filename]
+      });
+      const result = injected[0]?.result;
+      if (!result) throw new Error("页面没有返回下载结果，请刷新页面后重试。");
+      if (result.error) throw new Error(result.error);
+      return Number(result.size) || 0;
+    }
+    if (item.pageDownload) {
+      const size = await downloadViaPage(item, filename);
+      return size;
+    }
+    await saveUrl(item.url, filename);
+    return 0;
+  }
+
+  /** 把下载管理器的中断原因翻译成人话。 */
+  function downloadErrorText(reason) {
+    if (reason === "SERVER_FORBIDDEN") return "服务器拒绝了下载（403）。视频源有时会临时限流，过一会儿重试通常就好。";
+    if (reason === "SERVER_UNAUTHORIZED") return "地址已经过期，请重新打开弹窗刷新后再下载。";
+    if (reason === "NETWORK_FAILED" || reason === "NETWORK_TIMEOUT") return "网络中断或超时，检查网络后重试。";
+    if (reason === "FILE_FAILED" || reason === "FILE_ACCESS_DENIED" || reason === "FILE_NO_SPACE") {
+      return "写入文件失败，换一个保存位置或清理磁盘空间。";
+    }
+    if (reason === "USER_CANCELED" || reason === "USER_SHUTDOWN") return "";
+    return `下载中断（${reason}）。`;
+  }
+
+  /**
+   * 下载是交给浏览器在后台跑的，失败不会走 catch。
+   * 弹窗还开着的时候顺手监听一下，把原因显示到状态栏。
+   */
+  function watchDownloads() {
+    if (!HAS_CHROME || !chrome.downloads || !chrome.downloads.onChanged) return;
+    chrome.downloads.onChanged.addListener((delta) => {
+      if (!delta || !delta.state || delta.state.current !== "interrupted" || !delta.error) return;
+      const text = downloadErrorText(delta.error.current || "");
+      if (text) setStatus(text, "error");
+    });
   }
 
   /** 在页面世界执行：把 blob 读成 data URL；太大则退回页面原生保存。 */
@@ -564,8 +785,59 @@
     setStatus(`已合并 ${segments.length} 个分片（${MT.formatBytes(blob.size)}），保存为 ${finalName}。`);
   }
 
+  /** 视频轨要配的音频轨：优先 m4a，兼容性最好。 */
+  function bestAudioItem() {
+    return state.items.find((item) => item.source === "youtube" && item.kind === "audio" && item.bestAudio)
+      || state.items.find((item) => item.source === "youtube" && item.kind === "audio")
+      || null;
+  }
+
+  /** 扩展本身不做混流，视频轨和音频轨分开存，合并命令交给用户。 */
+  function mergeCommand(videoName, audioName) {
+    const out = `${videoName.replace(/\.[a-z0-9]+$/i, "")}-合并.mp4`;
+    return `ffmpeg -i "${videoName}" -i "${audioName}" -c copy "${out}"`;
+  }
+
   async function runDownload(item) {
     const filename = filenameFor(item);
+    // YouTube 的高清轨是「纯视频」，单独下下来是没声音的；顺手把音频轨也存下来并给出合并命令。
+    if (item.source === "youtube" && item.kind === "video" && item.hasAudio === false) {
+      const audio = bestAudioItem();
+      if (audio) {
+        const audioName = filenameFor(audio);
+        setHint("");
+        setProgress(null);
+        let videoSize = 0;
+        let audioSize = 0;
+        let failure = "";
+        try {
+          videoSize = await saveItem(item, filename);
+        } catch (error) {
+          failure = (error && error.message) || "视频轨取回失败。";
+        }
+        if (!failure) {
+          try {
+            audioSize = await saveItem(audio, audioName);
+          } catch (error) {
+            failure = `视频轨已保存，音频轨失败：${(error && error.message) || error}`;
+          }
+        }
+        if (!failure) {
+          setHint(mergeCommand(filename, audioName));
+          setStatus(`已保存视频轨和音频轨（共 2 个文件，${MT.formatBytes(videoSize + audioSize)}）。合并命令见下方。`, "ok");
+          return;
+        }
+        // 高清轨取不到时退到「画面+声音同一个文件」的格式，至少让用户拿到能直接播的东西。
+        const muxed = state.items.find((it) => it.source === "youtube" && it.kind === "video" && it.hasAudio === true);
+        if (muxed) {
+          const muxedName = filenameFor(muxed);
+          await saveItem(muxed, muxedName);
+          setStatus(`${failure} 已改为下载「${muxed.title}」，这个文件可以直接播放。`, "error");
+          return;
+        }
+        throw new Error(failure);
+      }
+    }
     if (item.kind === "dash") {
       throw new Error("DASH(.mpd) 需要 ffmpeg 才能合并，请先点「⧉」复制地址。");
     }
@@ -578,7 +850,11 @@
       await downloadHls(item, filename);
       return;
     }
-    await saveUrl(item.url, filename);
+    const size = await saveItem(item, filename);
+    if (size) {
+      setStatus(`已保存：${filename}（${MT.formatBytes(size)}）`, "ok");
+      return;
+    }
     setStatus(`已交给 Chrome 下载：${filename}`);
   }
 
@@ -588,6 +864,7 @@
     state.busy = true;
     els.downloadAll.disabled = true;
     els.downloadAll.textContent = "下载中…";
+    setHint("");
     let ok = 0;
     let failed = 0;
     for (let index = 0; index < items.length; index += 1) {
@@ -797,6 +1074,10 @@
       state.items = (response && response.items) || [];
       if (response && response.pageUrl) state.pageUrl = response.pageUrl;
       if (response && response.pageTitle && !state.pageTitle) state.pageTitle = response.pageTitle;
+      // 后台推新条目时也会走到这里，改写结果和平台直链必须跟着重新套一遍，
+      // 否则列表会退回「加密流 / 嗅探噪音」的原始状态。
+      applyPlatformStreams();
+      applyResolvedFields();
       render();
       const visible = allVisible();
       if (visible.length) {
@@ -811,6 +1092,101 @@
   }
 
   /* ------------------------------------------------------- 平台增强（可选） */
+
+  /** 原始地址 -> 改写结果（null 表示不需要或改不了）。避免每次刷新都重跑。 */
+  const resolvedUrls = new Map();
+  /** 平台元信息缓存，key 由适配器的 cacheKey 决定（YouTube 这类要发网络请求的才用）。 */
+  const platformMetaCache = new Map();
+
+  function platformCacheKey(adapter) {
+    if (!adapter || typeof adapter.cacheKey !== "function") return "";
+    try {
+      return `${adapter.id}|${adapter.cacheKey(state.pageUrl)}`;
+    } catch (error) {
+      return "";
+    }
+  }
+
+  /**
+   * 把适配器改写出来的地址写回条目上。
+   * 顺便合并指向同一真实地址的多条记录（央视一个视频会嗅到 5 条不同码率的 HLS）。
+   */
+  function applyResolvedFields() {
+    let changed = false;
+    const kept = [];
+    const seen = new Set();
+    for (const item of state.items) {
+      const resolved = resolvedUrls.get(item.url);
+      if (resolved && resolved.url && resolved.url !== item.url) {
+        item.originalUrl = item.url;
+        item.url = resolved.url;
+        if (resolved.title) item.title = resolved.title;
+        if (resolved.suffix) item.title = [item.title || deriveTitle(item), resolved.suffix].filter(Boolean).join(" ");
+        item.resolvedNote = resolved.note || "已切换可下载源";
+        changed = true;
+      }
+      if (seen.has(item.url)) {
+        changed = true;
+        continue;
+      }
+      seen.add(item.url);
+      kept.push(item);
+    }
+    if (changed) state.items = kept;
+  }
+
+  /** 把嗅探到的地址换成真正能下的地址（比如央视的加密流 -> 明文流）。 */
+  async function applyResolve() {
+    const adapter = state.platform;
+    if (!adapter || typeof adapter.resolve !== "function") return;
+    const targets = [];
+    for (const item of state.items) {
+      if (resolvedUrls.has(item.url)) continue;
+      if (typeof adapter.canResolve === "function") {
+        let ok = false;
+        try {
+          ok = Boolean(adapter.canResolve(item));
+        } catch (error) {
+          ok = false;
+        }
+        if (!ok) continue;
+      }
+      targets.push(item);
+    }
+    if (targets.length) {
+      setStatus("正在解析可直接下载的地址…", "busy");
+      const results = await Promise.all(targets.map(async (item) => {
+        try {
+          return [item.url, await adapter.resolve(item)];
+        } catch (error) {
+          return [item.url, null];
+        }
+      }));
+      for (const [url, value] of results) resolvedUrls.set(url, value || null);
+    }
+    applyResolvedFields();
+  }
+
+  /** 平台自己算出来的直链条目（目前只有 YouTube：SABR 模式下嗅探不到可用直链）。 */
+  function applyPlatformStreams() {
+    const meta = state.platformMeta;
+    if (!meta || !Array.isArray(meta.streams) || !meta.streams.length) return;
+    const known = new Set(state.items.map((item) => item.url));
+    const extra = [];
+    for (const stream of meta.streams) {
+      if (!stream || typeof stream.url !== "string") continue;
+      if (known.has(stream.url)) {
+        if (state.platform?.id === "douyin") {
+          const existing = state.items.find((item) => item.url === stream.url);
+          Object.assign(existing, stream);
+        }
+        continue;
+      }
+      known.add(stream.url);
+      extra.push({ ...stream, id: stream.url, source: stream.source || state.platform?.id || "platform", hidden: false, ts: Date.now() + extra.length });
+    }
+    if (extra.length) state.items = state.items.concat(extra);
+  }
 
   function renderMeta() {
     const meta = state.platformMeta;
@@ -845,7 +1221,12 @@
     }
 
     let meta = null;
-    if (typeof state.platform.extract === "function") {
+    const cacheKey = platformCacheKey(state.platform);
+    const cacheMs = Number(state.platform.cacheMs) || 0;
+    const cached = cacheKey && cacheMs ? platformMetaCache.get(cacheKey) : null;
+    if (cached && Date.now() - cached.ts < cacheMs) {
+      meta = cached.meta;
+    } else if (typeof state.platform.extract === "function") {
       try {
         const injected = await chrome.scripting.executeScript({
           target: { tabId: state.tabId, frameIds: [0] },
@@ -855,6 +1236,10 @@
         meta = (injected && injected[0] && injected[0].result) || null;
       } catch (error) {
         meta = null;
+      }
+      // 只缓存真正取到直链的结果，避免一次网络抖动把空结果锁住十分钟。
+      if (cacheKey && cacheMs && meta && Array.isArray(meta.streams) && meta.streams.length) {
+        platformMetaCache.set(cacheKey, { ts: Date.now(), meta });
       }
     }
 
@@ -876,6 +1261,8 @@
   async function reloadAll() {
     await load();
     await loadPlatformMeta();
+    applyPlatformStreams();
+    await applyResolve();
     render();
   }
 
@@ -890,9 +1277,12 @@
 
   if (HAS_CHROME) {
     chrome.runtime.onMessage.addListener((message) => {
-      if (message && message.type === "media-updated" && message.tabId === state.tabId) scheduleReload();
+      if (!message) return false;
+      if (message.type === "media-updated" && message.tabId === state.tabId) scheduleReload();
+      if (message.type === "download-progress") applyDownloadProgress(message);
       return false;
     });
+    watchDownloads();
   }
 
   els.refresh.addEventListener("click", () => {
@@ -905,6 +1295,11 @@
     const meta = state.platformMeta;
     const caption = meta ? String(meta.caption || meta.title || "").trim() : "";
     if (caption) copyText(caption, "文案");
+  });
+
+  els.hintCopy.addEventListener("click", () => {
+    const command = els.hintText.textContent || "";
+    if (command) copyText(command, "命令");
   });
 
   els.clear.addEventListener("click", async () => {
